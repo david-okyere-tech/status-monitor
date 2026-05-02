@@ -1,0 +1,6 @@
+Status Monitor Log - Target: https://google.com
+Started: 2026-05-02 12:13:14
+--------------------------------------------------
+[2026-05-02 12:13:14] Check 1: UP - Status 200 - OK
+[2026-05-02 12:13:19] Check 2: UP - Status 200 - OK
+[2026-05-02 12:13:25] Check 3: UP - Status 200 - OK
