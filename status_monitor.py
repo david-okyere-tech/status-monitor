@@ -38,14 +38,16 @@ import requests
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_INTERVAL = 60
 DEFAULT_TIMEOUT = 10
 DEFAULT_CHECKS = 0               # 0 = run until Ctrl+C
 DEFAULT_RETRIES = 2              # number of RETRIES after the first attempt
 DEFAULT_ALERT_THRESHOLD = 1
 DEFAULT_LOG_DIR = "./logs"
+DEFAULT_MAX_RESULTS = 10000      # cap in-memory results for long-running processes
 PID_FILENAME = "status_monitor.pid"
+
 
 # ---------------------------------------------------------------------------
 # URL validation
@@ -156,7 +158,7 @@ def check_url(
                 return CheckResult(url, "UP", resp.status_code, elapsed_ms, attempt=attempt)
             else:
                 last_error = f"Expected {expected_str}, got {resp.status_code}"
-                # Don't return immediately — retry, same as connection errors
+                # Retry unexpected status codes, same as connection errors
                 if attempt < max_attempts:
                     time.sleep(1)
                     continue
@@ -240,7 +242,14 @@ class AlertState:
     - Alert once when threshold is crossed (not on every check)
     - Send recovery notification when site comes back up
     - Cooldown prevents alert spam during flapping
-    - State persists across awareness (see note below on process restart)
+    - WARNING is treated as "not DOWN" — it resets the consecutive-down
+      counter but does NOT trigger recovery (only a UP after a confirmed
+      outage does). This prevents a flapping 500→200→500 pattern from
+      generating spurious recovery emails.
+
+    Note: State is in-memory only. Process restarts reset alert state.
+    After a restart, the threshold counter starts from zero, so a
+    persistent outage will be re-detected after `threshold` checks.
     """
 
     def __init__(self, urls: list[str], threshold: int, cooldown_checks: int = 3):
@@ -250,21 +259,21 @@ class AlertState:
         self.alert_fired: dict[str, bool] = {url: False for url in urls}
         self.outage_start: dict[str, Optional[str]] = {url: None for url in urls}
         self.cooldown_remaining: dict[str, int] = {url: 0 for url in urls}
+        # Track outage_start across cooldown so recovery emails work correctly
+        self._pending_outage_start: dict[str, Optional[str]] = {url: None for url in urls}
 
     def update(self, result: CheckResult) -> tuple[bool, bool]:
         """Process a check result and return (should_alert, is_recovery).
 
         should_alert: True if this check just crossed the threshold.
-        is_recovery: True if the site just came back up after a confirmed outage.
+        is_recovery: True if the site just came back UP after a confirmed outage.
         """
         url = result.url
 
         if result.status == "DOWN":
-            # In cooldown from a recent recovery — suppress alerts
+            # Decrement cooldown if active
             if self.cooldown_remaining[url] > 0:
                 self.cooldown_remaining[url] -= 1
-                self.consecutive_down[url] += 1
-                return False, False
 
             self.consecutive_down[url] += 1
 
@@ -278,27 +287,71 @@ class AlertState:
 
             return False, False
 
-        else:
-            # Site is up — check if we need to send recovery
+        elif result.status == "UP":
+            # UP means the site is genuinely working.
+            # Check if we need to send recovery after a confirmed outage.
             was_in_outage = self.alert_fired[url]
             outage_start = self.outage_start[url]
 
-            # Reset state
+            # Reset all state
             self.consecutive_down[url] = 0
             self.alert_fired[url] = False
             self.outage_start[url] = None
+            self._pending_outage_start[url] = None
 
             if was_in_outage and outage_start is not None:
                 # Start cooldown to prevent flapping spam
                 self.cooldown_remaining[url] = self.cooldown_checks
                 return False, True
 
+            # Also clear cooldown if site is UP and wasn't in outage
+            self.cooldown_remaining[url] = 0
+            return False, False
+
+        else:
+            # WARNING — site is reachable but returning unexpected status.
+            # This is NOT the same as UP: the site might be degraded.
+            # Reset the consecutive DOWN counter (site is reachable) but
+            # do NOT trigger recovery or reset outage tracking, because
+            # the site isn't actually healthy.
+            self.consecutive_down[url] = 0
+
+            # If there's no active outage, do nothing
+            if not self.alert_fired[url] and self.outage_start[url] is None:
+                return False, False
+
+            # If there IS an active outage, WARNING doesn't end it —
+            # the site is still degraded. No recovery email.
             return False, False
 
 
 # ---------------------------------------------------------------------------
 # Email alerting — configurable SMTP, not hardcoded Gmail
 # ---------------------------------------------------------------------------
+def _get_smtp_config(
+    smtp_host: Optional[str] = None,
+    smtp_port: Optional[int] = None,
+    smtp_user: Optional[str] = None,
+    smtp_pass: Optional[str] = None,
+    use_tls: Optional[bool] = None,
+) -> tuple[str, int, str, str, bool]:
+    """Resolve SMTP config from args or environment variables."""
+    host = smtp_host or os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    port = smtp_port or int(os.environ.get("SMTP_PORT", "587"))
+    user = (smtp_user or os.environ.get("SMTP_USER", "")).strip()
+    raw_pass = smtp_pass or os.environ.get("SMTP_PASS", "")
+    tls = use_tls if use_tls is not None else (
+        os.environ.get("SMTP_TLS", "true").lower() != "false"
+    )
+
+    # Warn if spaces are being stripped from password
+    if raw_pass and " " in raw_pass:
+        print(f"  ⚠️  Note: Spaces removed from SMTP_PASS. If auth fails, check the password.")
+        raw_pass = raw_pass.replace(" ", "")
+
+    return host, port, user, raw_pass, tls
+
+
 def send_email_alert(
     result: CheckResult,
     recipient: str,
@@ -317,26 +370,17 @@ def send_email_alert(
         SMTP_PASS  - Login password or App Password (required)
         SMTP_TLS   - Use STARTTLS: "true" or "false" (default: true)
     """
-    smtp_host = smtp_host or os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = smtp_port or int(os.environ.get("SMTP_PORT", "587"))
-    smtp_user = smtp_user or os.environ.get("SMTP_USER", "").strip()
-    smtp_pass = smtp_pass or os.environ.get("SMTP_PASS", "")
-    use_tls = use_tls if use_tls is not None else (
-        os.environ.get("SMTP_TLS", "true").lower() != "false"
+    host, port, user, passwd, tls = _get_smtp_config(
+        smtp_host, smtp_port, smtp_user, smtp_pass, use_tls
     )
 
-    # Warn if spaces are being stripped from password
-    if smtp_pass and " " in smtp_pass:
-        print(f"  ⚠️  Note: Spaces removed from SMTP_PASS. If auth fails, check the password.")
-        smtp_pass = smtp_pass.replace(" ", "")
-
-    if not smtp_user or not smtp_pass:
+    if not user or not passwd:
         print(f"  ⚠️  Email alert skipped: SMTP_USER and SMTP_PASS env vars not set")
         return
 
     msg = EmailMessage()
     msg["Subject"] = f"🚨 Status Monitor: {result.url} is DOWN"
-    msg["From"] = smtp_user
+    msg["From"] = user
     msg["To"] = recipient
     msg.set_content(
         f"Website Down Alert\n"
@@ -348,14 +392,14 @@ def send_email_alert(
     )
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            if use_tls:
+        with smtplib.SMTP(host, port) as server:
+            if tls:
                 server.starttls()
-            server.login(smtp_user, smtp_pass)
+            server.login(user, passwd)
             server.send_message(msg)
         print(f"  📧 Alert email sent to {recipient}")
     except smtplib.SMTPAuthenticationError:
-        print(f"  ⚠️  Email failed: SMTP auth error. Check SMTP_USER/SMTP_PASS for {smtp_host}:{smtp_port}")
+        print(f"  ⚠️  Email failed: SMTP auth error. Check SMTP_USER/SMTP_PASS for {host}:{port}")
     except Exception as exc:
         print(f"  ⚠️  Email failed: {exc}")
 
@@ -371,24 +415,21 @@ def send_recovery_email(
     smtp_pass: Optional[str] = None,
     use_tls: Optional[bool] = None,
 ) -> None:
-    """Send a recovery notification when a site comes back up."""
-    smtp_user_actual = smtp_user or os.environ.get("SMTP_USER", "").strip()
-    smtp_pass_actual = smtp_pass or os.environ.get("SMTP_PASS", "")
-    smtp_host_actual = smtp_host or os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    smtp_port_actual = smtp_port or int(os.environ.get("SMTP_PORT", "587"))
-    use_tls_actual = use_tls if use_tls is not None else (
-        os.environ.get("SMTP_TLS", "true").lower() != "false"
+    """Send a recovery notification when a site comes back UP.
+
+    Failures are logged but not treated as critical — the down alert
+    is the important one. Recovery is best-effort.
+    """
+    host, port, user, passwd, tls = _get_smtp_config(
+        smtp_host, smtp_port, smtp_user, smtp_pass, use_tls
     )
 
-    if " " in smtp_pass_actual:
-        smtp_pass_actual = smtp_pass_actual.replace(" ", "")
-
-    if not smtp_user_actual or not smtp_pass_actual:
+    if not user or not passwd:
         return  # Already warned in the down alert path
 
     msg = EmailMessage()
     msg["Subject"] = f"✅ Status Monitor: {url} is back UP"
-    msg["From"] = smtp_user_actual
+    msg["From"] = user
     msg["To"] = recipient
     msg.set_content(
         f"Site Recovery Alert\n"
@@ -399,14 +440,16 @@ def send_recovery_email(
     )
 
     try:
-        with smtplib.SMTP(smtp_host_actual, smtp_port_actual) as server:
-            if use_tls_actual:
+        with smtplib.SMTP(host, port) as server:
+            if tls:
                 server.starttls()
-            server.login(smtp_user_actual, smtp_pass_actual)
+            server.login(user, passwd)
             server.send_message(msg)
         print(f"  📧 Recovery email sent to {recipient}")
-    except Exception:
-        pass  # Non-critical — don't spam errors for recovery emails
+    except smtplib.SMTPAuthenticationError:
+        print(f"  ⚠️  Recovery email failed: SMTP auth error for {host}:{port}")
+    except Exception as exc:
+        print(f"  ⚠️  Recovery email failed (non-critical): {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +552,12 @@ def remove_pid_file(log_dir: str) -> None:
 
 
 def is_already_running(log_dir: str) -> Optional[int]:
-    """Check if another instance is already running. Returns PID or None."""
+    """Check if another instance using the same log directory is running.
+
+    Note: This check is per-log-directory, not per-host. Two instances
+    with different --log-dir values will not detect each other. If you
+    need to prevent any duplicate, use a shared log directory.
+    """
     pid_path = os.path.join(log_dir, PID_FILENAME)
     if not os.path.exists(pid_path):
         return None
@@ -645,18 +693,23 @@ def main() -> None:
     count_warnings_as_up = not args.strict_uptime
     verbose = args.verbose
 
-    # Check for existing instance
+    # Check for existing instance using the same log directory
     existing_pid = is_already_running(log_dir)
     if existing_pid:
-        print(f"❌ Another instance is already running (PID {existing_pid}).")
+        print(f"❌ Another instance is already running with this log dir (PID {existing_pid}).")
         print(f"   If this is stale, delete {os.path.join(log_dir, PID_FILENAME)}")
         sys.exit(1)
 
     # Set up log directory
     os.makedirs(log_dir, exist_ok=True)
 
+    # Initialize before try so finally can always reference them
     log_file = None
     history_file = None
+    log_filename = ""
+    history_path = ""
+    results: list[CheckResult] = []
+    check_count = 0
 
     try:
         # Open log and history files inside the try block
@@ -698,12 +751,12 @@ def main() -> None:
         print(f"   📊 History: {history_path}")
         print(f"   🔑 PID: {os.getpid()}\n")
 
-        # Track results for summary
-        results: list[CheckResult] = []
-        check_count = 0
-
         # Alert state tracker
         alert_state = AlertState(urls, threshold=alert_threshold)
+
+        # Store the outage start for recovery emails (AlertState resets it
+        # on recovery, so we capture it before calling update())
+        last_outage_start: dict[str, Optional[str]] = {url: None for url in urls}
 
         while True:
             check_start = time.monotonic()
@@ -715,11 +768,17 @@ def main() -> None:
             )
 
             for result in check_results:
-                results.append(result)
+                # Capture outage_start before update() resets it
+                last_outage_start[result.url] = alert_state.outage_start.get(result.url)
 
                 # Update alert state
                 should_alert, is_recovery = alert_state.update(result)
                 alert_active = alert_state.alert_fired.get(result.url, False)
+
+                # Append to results (cap to prevent unbounded memory growth)
+                results.append(result)
+                if len(results) > DEFAULT_MAX_RESULTS:
+                    results = results[-DEFAULT_MAX_RESULTS:]
 
                 # Console output
                 print(result.console_line(alert_active=alert_active))
@@ -736,13 +795,12 @@ def main() -> None:
                 if should_alert and email_recipient:
                     send_email_alert(result, email_recipient)
 
-                # Recovery notification
+                # Recovery notification (only on UP after confirmed outage)
                 if is_recovery and email_recipient:
-                    outage_start = alert_state.outage_start.get(result.url)
-                    # outage_start was already reset, but we can use the result timestamp
+                    outage_start = last_outage_start.get(result.url) or "unknown"
                     send_recovery_email(
                         result.url,
-                        outage_start or "unknown",
+                        outage_start,
                         result.timestamp,
                         email_recipient,
                     )
@@ -752,7 +810,6 @@ def main() -> None:
                 break
 
             # Sleep only the remaining time to maintain accurate intervals
-            # This accounts for how long the checks actually took
             elapsed = time.monotonic() - check_start
             sleep_time = max(0, interval - elapsed)
 

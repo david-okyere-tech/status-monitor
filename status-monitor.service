@@ -8,21 +8,28 @@ Type=simple
 User=statusmonitor
 Group=statusmonitor
 WorkingDirectory=/opt/status-monitor
-ExecStart=/opt/status-monitor/venv/bin/python status_monitor.py --url https://example.com --interval 60 --email alerts@example.com
+
+# EDIT THIS: Change the URL and options to match your setup
+ExecStart=/opt/status-monitor/venv/bin/python status_monitor.py \
+    --url https://example.com \
+    --interval 60 \
+    --email alerts@example.com
+
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
-# Environment — set SMTP credentials here or use an EnvironmentFile
-# Environment="SMTP_HOST=smtp.gmail.com"
-# Environment="SMTP_PORT=587"
-# Environment="SMTP_USER=yourbot@gmail.com"
-# Environment="SMTP_PASS=your-app-password"
-# Environment="SMTP_TLS=true"
+# Load SMTP credentials from a separate file (recommended).
+# This keeps credentials out of `systemctl show` output.
+# Copy .env.example to /opt/status-monitor/.env and fill in your values.
+EnvironmentFile=/opt/status-monitor/.env
 
-# Or use a separate env file:
-# EnvironmentFile=/opt/status-monitor/.env
+# Basic systemd hardening
+ProtectSystem=strict
+NoNewPrivileges=true
+PrivateTmp=true
+ReadWritePaths=/opt/status-monitor/logs
 
 [Install]
 WantedBy=multi-user.target
