@@ -9,11 +9,13 @@ A Python website uptime monitor built for real-world use — parallel checking, 
 - **Accurate intervals** — Tracks wall-clock time so checks stay on schedule even when requests take time
 - **Consistent retries** — Both connection failures AND unexpected status codes (503, etc.) get retried
 - **Configurable SSL** — `--no-verify-ssl` for internal services with self-signed certs
+- **Bounded memory** — Results list capped at 10,000 entries for long-running processes
 
 **Alerting**
 - **Alert once per outage** — Fires when threshold is crossed, not on every check
-- **Recovery notifications** — Email when a site comes back up, including outage duration
+- **Recovery notifications** — Email when a site comes back UP, including outage duration
 - **Cooldown on flapping** — Prevents spam when a site bounces up/down rapidly
+- **WARNING ≠ recovery** — A 500 after a DOWN doesn't trigger "recovered" (only UP does)
 - **Configurable SMTP** — Works with Gmail, SendGrid, SES, Mailgun, or any SMTP server
 
 **Data & Reporting**
@@ -23,9 +25,9 @@ A Python website uptime monitor built for real-world use — parallel checking, 
 - **`--strict-uptime`** — Choose whether WARNING counts as "up" in the summary
 
 **Process Management**
-- **PID file** — Detects if another instance is already running
+- **PID file** — Detects if another instance using the same log directory is already running
 - **Graceful shutdown** — Ctrl+C still prints summary and closes files cleanly
-- **systemd unit** — Run as a system service that restarts on crash
+- **systemd unit** — Run as a hardened system service that restarts on crash
 
 ## Quick Start
 
@@ -78,7 +80,7 @@ Set SMTP credentials as environment variables:
 export SMTP_USER="yourbot@gmail.com"
 export SMTP_PASS="your-16-char-app-password"
 
-# Custom SMTP server
+# Custom SMTP server (SendGrid, SES, Mailgun, etc.)
 export SMTP_HOST="smtp.sendgrid.net"
 export SMTP_PORT="587"
 export SMTP_USER="apikey"
@@ -103,17 +105,20 @@ The alert system handles the full outage lifecycle:
 
 1. **DOWN detected** — Counter increments per URL
 2. **Threshold crossed** — Alert fires once (not on every check)
-3. **Site recovers** — Recovery email sent with outage start time and duration
+3. **Site recovers (UP)** — Recovery email sent with outage start time and duration
 4. **Cooldown** — If site flaps (up/down rapidly), alerts are suppressed for a few checks after recovery
+5. **WARNING ≠ recovery** — A WARNING (unexpected status) does NOT end an outage. Only a UP does.
 
 ```
 ⬇️  Check 1: DOWN (below threshold, no alert)
 ⬇️  Check 2: DOWN (below threshold, no alert)
 🚨  Check 3: DOWN (threshold reached, alert fires 📧)
 ⬇️  Check 4: DOWN (already alerted, no duplicate)
-✅  Check 5: UP (recovery email 📧, cooldown starts)
-⬇️  Check 6: DOWN (in cooldown, suppressed)
-⬇️  Check 7: DOWN (cooldown expired, counter restarts)
+⚠️  Check 5: WARNING 500 (site reachable but degraded — no recovery)
+⬇️  Check 6: DOWN (cooldown active from prior alert, suppressed)
+✅  Check 7: UP (recovery email 📧, cooldown starts)
+⬇️  Check 8: DOWN (in cooldown, suppressed)
+⬇️  Check 9: DOWN (cooldown expired, counter restarts)
 ```
 
 ## Running as a Service
@@ -122,8 +127,12 @@ The alert system handles the full outage lifecycle:
 # Copy the service file
 sudo cp status-monitor.service /etc/systemd/system/
 
-# Edit it with your URLs and settings
+# EDIT THE URL in the service file before enabling!
 sudo nano /etc/systemd/system/status-monitor.service
+
+# Copy and fill in SMTP credentials
+cp .env.example /opt/status-monitor/.env
+nano /opt/status-monitor/.env
 
 # Enable and start
 sudo systemctl daemon-reload
@@ -136,6 +145,11 @@ sudo systemctl status status-monitor
 # View logs
 journalctl -u status-monitor -f
 ```
+
+The service file uses `EnvironmentFile` for credentials (not inline `Environment=`)
+because `systemctl show` reveals inline values to any user. It also enables
+`ProtectSystem=strict`, `NoNewPrivileges=true`, and `PrivateTmp=true` for
+basic sandboxing.
 
 ## Output
 
@@ -179,8 +193,8 @@ journalctl -u status-monitor -f
 Each line is schema-versioned and self-contained:
 
 ```jsonl
-{"v": 2, "url": "https://example.com", "timestamp": "2026-06-04 04:52:00", "status": "UP", "status_code": 200, "response_time_ms": 142.3, "error": null, "attempt": 1}
-{"v": 2, "url": "https://example.com", "timestamp": "2026-06-04 04:54:00", "status": "DOWN", "status_code": null, "response_time_ms": null, "error": "Connection failed", "attempt": 3}
+{"v": 3, "url": "https://example.com", "timestamp": "2026-06-04 04:52:00", "status": "UP", "status_code": 200, "response_time_ms": 142.3, "error": null, "attempt": 1}
+{"v": 3, "url": "https://example.com", "timestamp": "2026-06-04 04:54:00", "status": "DOWN", "status_code": null, "response_time_ms": null, "error": "Connection failed", "attempt": 3}
 ```
 
 ## Tech Stack
