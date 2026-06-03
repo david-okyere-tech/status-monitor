@@ -1,67 +1,63 @@
 """
 Status Monitor - A website uptime monitoring tool.
 
-Monitors one or more URLs at configurable intervals, logs results,
-and supports alerting via console, email, or webhook.
+Monitors one or more URLs at configurable intervals, logs results with
+response times, and optionally alerts via email when a site goes DOWN.
 
 Usage:
-    python status_monitor.py                          # interactive mode
-    python status_monitor.py --config config.yaml     # config file mode
-    python status_monitor.py -u https://example.com   # quick single URL
+    python status_monitor.py --url https://example.com
+    python status_monitor.py --url https://example.com --interval 30 --checks 10
+    python status_monitor.py --url https://example.com --email you@gmail.com
+
+Email alerting requires SMTP credentials set as environment variables:
+    SMTP_USER  - Gmail address (e.g. yourbot@gmail.com)
+    SMTP_PASS  - Gmail App Password (NOT your regular password)
+
+    To generate a Gmail App Password:
+      1. Go to https://myaccount.google.com/apppasswords
+      2. Sign in, select "Mail" and your device, click Generate
+      3. Use the 16-character password as SMTP_PASS
 """
 
 import argparse
 import json
-import logging
 import os
-import signal
 import smtplib
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from email.message import EmailMessage
-from pathlib import Path
+from urllib.parse import urlparse
 from typing import Optional
 
 import requests
-import yaml
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 DEFAULT_INTERVAL = 60          # seconds between checks
-DEFAULT_TIMEOUT = 10           # HTTP request timeout
+DEFAULT_TIMEOUT = 10           # HTTP request timeout in seconds
+DEFAULT_CHECKS = 0             # 0 = run until stopped with Ctrl+C
 DEFAULT_MAX_RETRIES = 2        # retries before declaring DOWN
-LOG_DIR = Path("logs")
-HISTORY_FILE = Path("history.json")
+
 
 # ---------------------------------------------------------------------------
-# Logging setup
+# URL validation
 # ---------------------------------------------------------------------------
-def setup_logging(verbose: bool = False) -> logging.Logger:
-    """Configure structured console + file logging."""
-    logger = logging.getLogger("status_monitor")
-    logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+def is_valid_url(url: str) -> bool:
+    """Validate a URL using urllib.parse.urlparse.
 
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)-7s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
-    # Console handler
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-
-    # File handler
-    LOG_DIR.mkdir(exist_ok=True)
-    fh = logging.FileHandler(
-        LOG_DIR / f"monitor_{datetime.now().strftime('%Y%m%d')}.log"
-    )
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    return logger
+    Checks that the URL has a scheme (http/https) and a network location.
+    This is more robust than simple startswith() checks.
+    """
+    try:
+        result = urlparse(url)
+        return all([
+            result.scheme in ("http", "https"),
+            result.netloc,           # must have a domain
+        ])
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +69,7 @@ class CheckResult:
     def __init__(self, url: str, status: str, status_code: Optional[int],
                  response_time_ms: Optional[float], error: Optional[str] = None):
         self.url = url
-        self.timestamp = datetime.now(timezone.utc).isoformat()
+        self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.status = status            # UP / DOWN / WARNING
         self.status_code = status_code
         self.response_time_ms = response_time_ms
@@ -82,11 +78,25 @@ class CheckResult:
     def to_dict(self) -> dict:
         return self.__dict__
 
-    def __str__(self) -> str:
+    def log_line(self) -> str:
+        """Format for log file — includes response time."""
+        code = f" | Status: {self.status_code}" if self.status_code else ""
+        rt = f" | Response: {self.response_time_ms:.0f}ms" if self.response_time_ms else ""
+        err = f" | Error: {self.error}" if self.error else ""
+        return f"[{self.timestamp}] {self.url} -> {self.status}{code}{rt}{err}"
+
+    def console_line(self) -> str:
+        """Format for console output with emoji."""
         code = f" ({self.status_code})" if self.status_code else ""
         rt = f" {self.response_time_ms:.0f}ms" if self.response_time_ms else ""
         err = f" - {self.error}" if self.error else ""
-        return f"[{self.timestamp}] {self.url}: {self.status}{code}{rt}{err}"
+        if self.status == "UP":
+            icon = "✅"
+        elif self.status == "DOWN":
+            icon = "🚨"
+        else:
+            icon = "⚠️"
+        return f"{icon} [{self.timestamp}] {self.url}: {self.status}{code}{rt}{err}"
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +107,8 @@ def check_url(url: str, timeout: int = DEFAULT_TIMEOUT,
               expected_status: int = 200) -> CheckResult:
     """
     Send an HTTP GET to *url* and return a CheckResult.
-    Retries up to *max_retries* times before declaring DOWN.
+    Retries up to *max_retries* times before declaring DOWN to avoid
+    false alarms from momentary blips.
     """
     last_error = None
 
@@ -131,194 +142,118 @@ def check_url(url: str, timeout: int = DEFAULT_TIMEOUT,
 
 
 # ---------------------------------------------------------------------------
-# History persistence
+# Email alerting
 # ---------------------------------------------------------------------------
-def save_result(result: CheckResult) -> None:
-    """Append a result to the JSON history file."""
-    history = []
-    if HISTORY_FILE.exists():
-        try:
-            history = json.loads(HISTORY_FILE.read_text())
-        except (json.JSONDecodeError, ValueError):
-            history = []
+def send_email_alert(result: CheckResult, recipient: str) -> None:
+    """Send a DOWN alert email using SMTP credentials from environment variables.
 
-    history.append(result.to_dict())
-    HISTORY_FILE.write_text(json.dumps(history, indent=2))
+    Required environment variables:
+        SMTP_USER  - Gmail address (e.g. yourbot@gmail.com)
+        SMTP_PASS  - Gmail App Password (16 chars, no spaces)
+
+    To set them:
+        export SMTP_USER="yourbot@gmail.com"
+        export SMTP_PASS="abcd efgh ijkl mnop"   # or without spaces
+
+    For Gmail, you MUST use an App Password, not your regular password.
+    Generate one at: https://myaccount.google.com/apppasswords
+    """
+    smtp_user = os.environ.get("SMTP_USER", "").strip()
+    smtp_pass = os.environ.get("SMTP_PASS", "").strip().replace(" ", "")
+
+    if not smtp_user or not smtp_pass:
+        print(f"  ⚠️  Email alert skipped: SMTP_USER and SMTP_PASS env vars not set")
+        return
+
+    msg = EmailMessage()
+    msg["Subject"] = f"🚨 Status Monitor: {result.url} is DOWN"
+    msg["From"] = smtp_user
+    msg["To"] = recipient
+    msg.set_content(
+        f"Website Down Alert\n"
+        f"{'=' * 40}\n\n"
+        f"URL: {result.url}\n"
+        f"Time: {result.timestamp}\n"
+        f"Status: {result.status}\n"
+        f"Error: {result.error or 'Unknown'}\n"
+    )
+
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        print(f"  📧 Alert email sent to {recipient}")
+    except smtplib.SMTPAuthenticationError:
+        print(f"  ⚠️  Email failed: SMTP authentication error. Check SMTP_USER/SMTP_PASS.")
+    except Exception as exc:
+        print(f"  ⚠️  Email failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# Alerting
+# Summary report
 # ---------------------------------------------------------------------------
-class Alerter:
-    """Base alerter — just logs."""
+def print_summary(results: list[CheckResult], urls: list[str]) -> None:
+    """Print a summary report after monitoring completes.
 
-    def __init__(self, logger: logging.Logger):
-        self.logger = logger
+    Shows per-URL: total checks, uptime %, average response time, downtime periods.
+    """
+    if not results:
+        return
 
-    def send(self, result: CheckResult) -> None:
-        if result.status == "DOWN":
-            self.logger.warning(f"🚨 ALERT: {result}")
-        elif result.status == "WARNING":
-            self.logger.warning(f"⚠️  {result}")
+    print("\n" + "=" * 60)
+    print("  MONITORING SUMMARY")
+    print("=" * 60)
+
+    for url in urls:
+        url_results = [r for r in results if r.url == url]
+        if not url_results:
+            continue
+
+        total = len(url_results)
+        up_count = sum(1 for r in url_results if r.status == "UP")
+        warning_count = sum(1 for r in url_results if r.status == "WARNING")
+        down_count = sum(1 for r in url_results if r.status == "DOWN")
+        uptime_pct = (up_count / total) * 100 if total else 0
+
+        # Response times (only for checks that got a response)
+        response_times = [r.response_time_ms for r in url_results if r.response_time_ms is not None]
+        avg_rt = sum(response_times) / len(response_times) if response_times else 0
+        min_rt = min(response_times) if response_times else 0
+        max_rt = max(response_times) if response_times else 0
+
+        # Downtime periods
+        downtime_periods = []
+        in_downtime = False
+        downtime_start = None
+        for r in url_results:
+            if r.status == "DOWN" and not in_downtime:
+                downtime_start = r.timestamp
+                in_downtime = True
+            elif r.status != "DOWN" and in_downtime:
+                downtime_periods.append((downtime_start, r.timestamp))
+                in_downtime = False
+        if in_downtime:
+            downtime_periods.append((downtime_start, url_results[-1].timestamp))
+
+        print(f"\n  📍 {url}")
+        print(f"  {'─' * 50}")
+        print(f"  Total checks:     {total}")
+        print(f"  UP: {up_count}  |  WARNING: {warning_count}  |  DOWN: {down_count}")
+        print(f"  Uptime:           {uptime_pct:.1f}%")
+        if response_times:
+            print(f"  Response time:    avg {avg_rt:.0f}ms  |  min {min_rt:.0f}ms  |  max {max_rt:.0f}ms")
         else:
-            self.logger.info(f"✅ {result}")
+            print(f"  Response time:    N/A (all checks failed)")
 
+        if downtime_periods:
+            print(f"  Downtime periods:")
+            for start, end in downtime_periods:
+                print(f"    • {start} → {end}")
+        else:
+            print(f"  Downtime periods: None 🎉")
 
-class WebhookAlerter(Alerter):
-    """POST check results to a webhook URL."""
-
-    def __init__(self, logger: logging.Logger, url: str):
-        super().__init__(logger)
-        self.webhook_url = url
-
-    def send(self, result: CheckResult) -> None:
-        super().send(result)
-        if result.status in ("DOWN", "WARNING"):
-            try:
-                requests.post(
-                    self.webhook_url,
-                    json=result.to_dict(),
-                    timeout=5,
-                )
-            except requests.RequestException as exc:
-                self.logger.error(f"Webhook delivery failed: {exc}")
-
-
-class EmailAlerter(Alerter):
-    """Send email alerts on downtime."""
-
-    def __init__(self, logger: logging.Logger, smtp_host: str, smtp_port: int,
-                 sender: str, recipient: str,
-                 username: Optional[str] = None,
-                 password: Optional[str] = None,
-                 use_tls: bool = True):
-        super().__init__(logger)
-        self.smtp_host = smtp_host
-        self.smtp_port = smtp_port
-        self.sender = sender
-        self.recipient = recipient
-        self.username = username
-        self.password = password
-        self.use_tls = use_tls
-
-    def send(self, result: CheckResult) -> None:
-        super().send(result)
-        if result.status != "DOWN":
-            return
-
-        msg = EmailMessage()
-        msg["Subject"] = f"🚨 Status Monitor Alert: {result.url} is DOWN"
-        msg["From"] = self.sender
-        msg["To"] = self.recipient
-        msg.set_content(str(result))
-
-        try:
-            with smtplib.SMTP(self.smtp_host, self.smtp_port) as server:
-                if self.use_tls:
-                    server.starttls()
-                if self.username and self.password:
-                    server.login(self.username, self.password)
-                server.send_message(msg)
-        except Exception as exc:
-            self.logger.error(f"Email delivery failed: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Config loading
-# ---------------------------------------------------------------------------
-DEFAULT_CONFIG = {
-    "urls": [],
-    "interval": DEFAULT_INTERVAL,
-    "timeout": DEFAULT_TIMEOUT,
-    "max_retries": DEFAULT_MAX_RETRIES,
-    "expected_status": 200,
-    "alerts": {
-        "webhook": None,
-        "email": None,
-    },
-}
-
-
-def load_config(path: str) -> dict:
-    """Load and merge config from a YAML file."""
-    cfg = DEFAULT_CONFIG.copy()
-    if os.path.exists(path):
-        with open(path) as f:
-            user_cfg = yaml.safe_load(f) or {}
-        cfg.update(user_cfg)
-    return cfg
-
-
-# ---------------------------------------------------------------------------
-# Monitor loop
-# ---------------------------------------------------------------------------
-class Monitor:
-    """Orchestrates periodic checks for one or more URLs."""
-
-    def __init__(self, config: dict, logger: logging.Logger):
-        self.config = config
-        self.logger = logger
-        self.running = True
-        self.alerters: list[Alerter] = [Alerter(logger)]
-
-        # Set up alerters from config
-        alerts = config.get("alerts", {})
-        if alerts.get("webhook"):
-            self.alerters.append(WebhookAlerter(logger, alerts["webhook"]))
-
-        email_cfg = alerts.get("email")
-        if email_cfg:
-            self.alerters.append(EmailAlerter(
-                logger,
-                smtp_host=email_cfg["smtp_host"],
-                smtp_port=email_cfg.get("smtp_port", 587),
-                sender=email_cfg["sender"],
-                recipient=email_cfg["recipient"],
-                username=email_cfg.get("username"),
-                password=email_cfg.get("password"),
-                use_tls=email_cfg.get("use_tls", True),
-            ))
-
-        # Graceful shutdown
-        signal.signal(signal.SIGINT, self._shutdown)
-        signal.signal(signal.SIGTERM, self._shutdown)
-
-    def _shutdown(self, signum, frame):
-        self.logger.info("Shutdown signal received, stopping…")
-        self.running = False
-
-    def run(self) -> None:
-        """Run the monitoring loop until stopped."""
-        urls = self.config.get("urls", [])
-        interval = self.config.get("interval", DEFAULT_INTERVAL)
-
-        if not urls:
-            self.logger.error("No URLs configured. Add URLs to config.yaml or use -u flag.")
-            return
-
-        self.logger.info(
-            f"Monitoring {len(urls)} URL(s) every {interval}s — press Ctrl+C to stop"
-        )
-
-        while self.running:
-            for url in urls:
-                result = check_url(
-                    url,
-                    timeout=self.config.get("timeout", DEFAULT_TIMEOUT),
-                    max_retries=self.config.get("max_retries", DEFAULT_MAX_RETRIES),
-                    expected_status=self.config.get("expected_status", 200),
-                )
-                save_result(result)
-                for alerter in self.alerters:
-                    alerter.send(result)
-
-            # Sleep in small increments so Ctrl+C is responsive
-            for _ in range(interval):
-                if not self.running:
-                    break
-                time.sleep(1)
-
-        self.logger.info("Monitor stopped.")
+    print("\n" + "=" * 60 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -326,81 +261,178 @@ class Monitor:
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Website Status Monitor — monitor uptime with alerting",
+        description="Website Status Monitor — check uptime, track response times, alert on downtime",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  python status_monitor.py -u https://example.com
-  python status_monitor.py -u https://example.com -u https://google.com
-  python status_monitor.py --config config.yaml
-  python status_monitor.py --config config.yaml --interval 30
+  python status_monitor.py --url https://example.com
+  python status_monitor.py --url https://example.com --interval 30 --checks 10
+  python status_monitor.py --url https://example.com --url https://google.com
+  python status_monitor.py --url https://example.com --email you@gmail.com
+
+Email setup (Gmail):
+  export SMTP_USER="yourbot@gmail.com"
+  export SMTP_PASS="your-16-char-app-password"
+  python status_monitor.py --url https://example.com --email you@gmail.com
 """,
     )
     p.add_argument(
-        "-u", "--url", action="append", dest="urls",
-        help="URL(s) to monitor (can specify multiple times)",
+        "--url", action="append", dest="urls", required=True,
+        help="URL(s) to monitor — use --url multiple times for several sites",
     )
     p.add_argument(
-        "-c", "--config", default="config.yaml",
-        help="Path to config YAML file (default: config.yaml)",
+        "--interval", type=int, default=DEFAULT_INTERVAL,
+        help=f"Seconds between checks (default: {DEFAULT_INTERVAL})",
     )
     p.add_argument(
-        "-i", "--interval", type=int, default=None,
-        help="Check interval in seconds (overrides config)",
+        "--checks", type=int, default=DEFAULT_CHECKS,
+        help="Number of checks to run (default: 0 = run until Ctrl+C)",
     )
     p.add_argument(
-        "-t", "--timeout", type=int, default=None,
-        help="HTTP request timeout in seconds",
+        "--timeout", type=int, default=DEFAULT_TIMEOUT,
+        help=f"HTTP request timeout in seconds (default: {DEFAULT_TIMEOUT})",
     )
     p.add_argument(
-        "-r", "--max-retries", type=int, default=None,
-        help="Max retries before declaring DOWN",
+        "--retries", type=int, default=DEFAULT_MAX_RETRIES,
+        help=f"Retries before declaring DOWN (default: {DEFAULT_MAX_RETRIES})",
+    )
+    p.add_argument(
+        "--email", type=str, default=None,
+        help="Email address to send DOWN alerts to (requires SMTP_USER/SMTP_PASS env vars)",
+    )
+    p.add_argument(
+        "--expected-status", type=int, default=200,
+        help="Expected HTTP status code (default: 200)",
     )
     p.add_argument(
         "-v", "--verbose", action="store_true",
-        help="Enable debug-level logging",
+        help="Enable verbose output",
     )
     return p
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    logger = setup_logging(verbose=args.verbose)
-
-    # Load config file (creates default if missing)
-    config = load_config(args.config)
-
-    # CLI flags override config
-    if args.urls:
-        config["urls"] = args.urls
-    if args.interval is not None:
-        config["interval"] = args.interval
-    if args.timeout is not None:
-        config["timeout"] = args.timeout
-    if args.max_retries is not None:
-        config["max_retries"] = args.max_retries
-
-    # Interactive fallback: ask for URL if none provided
-    if not config["urls"]:
-        url = input("Enter the URL to monitor (include https://): ").strip()
-        if not url:
-            logger.error("No URL provided. Exiting.")
-            sys.exit(1)
-        if not url.startswith(("http://", "https://")):
-            logger.error("URL must start with http:// or https://")
-            sys.exit(1)
-        config["urls"] = [url]
-
-    # Validate URLs
-    for url in config["urls"]:
-        if not url.startswith(("http://", "https://")):
-            logger.error(f"Invalid URL: {url} — must start with http:// or https://")
+    # Validate URLs using urllib.parse
+    for url in args.urls:
+        if not is_valid_url(url):
+            print(f"❌ Invalid URL: {url}")
+            print(f"   URLs must include a scheme (http:// or https://) and a domain.")
             sys.exit(1)
 
-    monitor = Monitor(config, logger)
-    monitor.run()
+    # Validate interval
+    if args.interval < 1:
+        print("❌ Interval must be at least 1 second.")
+        sys.exit(1)
+
+    urls = args.urls
+    interval = args.interval
+    max_checks = args.checks if args.checks > 0 else None   # None = infinite
+    timeout = args.timeout
+    max_retries = args.retries
+    expected_status = args.expected_status
+    email_recipient = args.email
+    verbose = args.verbose
+
+    # Open log file once for the entire run (append mode, date-stamped)
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_filename = os.path.join(log_dir, f"status_log_{datetime.now().strftime('%Y-%m-%d')}.txt")
+
+    log_file = open(log_filename, "a", encoding="utf-8")
+
+    # Write session header
+    header = (
+        f"\n{'=' * 60}\n"
+        f"Status Monitor Session\n"
+        f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"URLs: {', '.join(urls)}\n"
+        f"Interval: {interval}s | Timeout: {timeout}s | Retries: {max_retries}\n"
+        f"{'=' * 60}\n"
+    )
+    log_file.write(header)
+    log_file.flush()
+
+    print(f"\n🔍 Monitoring {len(urls)} URL(s) every {interval}s")
+    if max_checks:
+        print(f"   Running {max_checks} check(s)")
+    else:
+        print(f"   Running until Ctrl+C")
+    if email_recipient:
+        print(f"   📧 Email alerts → {email_recipient}")
+    print(f"   📄 Log file: {log_filename}\n")
+
+    # Track results for summary
+    results: list[CheckResult] = []
+    check_count = 0
+
+    try:
+        while True:
+            check_count += 1
+
+            for url in urls:
+                result = check_url(
+                    url,
+                    timeout=timeout,
+                    max_retries=max_retries,
+                    expected_status=expected_status,
+                )
+                results.append(result)
+
+                # Console output
+                print(result.console_line())
+
+                # Log file output
+                log_file.write(result.log_line() + "\n")
+                log_file.flush()
+
+                # Save to JSON history
+                history_path = os.path.join(log_dir, "history.json")
+                history = []
+                if os.path.exists(history_path):
+                    try:
+                        with open(history_path, "r") as hf:
+                            history = json.load(hf)
+                    except (json.JSONDecodeError, ValueError):
+                        history = []
+                history.append(result.to_dict())
+                with open(history_path, "w") as hf:
+                    json.dump(history, hf, indent=2)
+
+                # Email alert on DOWN
+                if result.status == "DOWN" and email_recipient:
+                    send_email_alert(result, email_recipient)
+
+            # Check if we've reached the requested number of checks
+            if max_checks and check_count >= max_checks:
+                break
+
+            # Sleep in 1-second increments for responsive Ctrl+C
+            for _ in range(interval):
+                time.sleep(1)
+
+    except KeyboardInterrupt:
+        print("\n\n⏹  Stopped by Ctrl+C")
+
+    finally:
+        # Always print summary and close log cleanly
+        print_summary(results, urls)
+
+        # Write session footer to log
+        footer = (
+            f"\n{'─' * 60}\n"
+            f"Session ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Total checks: {check_count}\n"
+            f"{'=' * 60}\n"
+        )
+        log_file.write(footer)
+        log_file.close()
+        print(f"📄 Log saved to: {log_filename}")
 
 
 if __name__ == "__main__":
