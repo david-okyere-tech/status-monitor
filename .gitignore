@@ -3,10 +3,7 @@ logs/
 *.log
 
 # History
-history.json
-
-# Config (contains secrets)
-config.yaml
+history.jsonl
 
 # Python
 __pycache__/
