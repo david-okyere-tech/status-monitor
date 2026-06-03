@@ -1,5 +1,4 @@
-"""
-Status Monitor - A website uptime monitoring tool.
+"""Status Monitor - A website uptime monitoring tool.
 
 Monitors one or more URLs at configurable intervals, logs results with
 response times, and optionally alerts via email when a site goes DOWN.
@@ -19,6 +18,8 @@ Email alerting requires SMTP credentials set as environment variables:
       3. Use the 16-character password as SMTP_PASS
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -27,8 +28,8 @@ import sys
 import time
 from datetime import datetime
 from email.message import EmailMessage
-from urllib.parse import urlparse
 from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -39,6 +40,7 @@ DEFAULT_INTERVAL = 60          # seconds between checks
 DEFAULT_TIMEOUT = 10           # HTTP request timeout in seconds
 DEFAULT_CHECKS = 0             # 0 = run until stopped with Ctrl+C
 DEFAULT_MAX_RETRIES = 2        # retries before declaring DOWN
+DEFAULT_ALERT_THRESHOLD = 1    # consecutive DOWN checks before alerting
 
 
 # ---------------------------------------------------------------------------
@@ -85,15 +87,20 @@ class CheckResult:
         err = f" | Error: {self.error}" if self.error else ""
         return f"[{self.timestamp}] {self.url} -> {self.status}{code}{rt}{err}"
 
-    def console_line(self) -> str:
-        """Format for console output with emoji."""
+    def console_line(self, alert_active: bool = False) -> str:
+        """Format for console output with emoji.
+
+        Args:
+            alert_active: If True and status is DOWN, show the 🚨 icon.
+                          If False and status is DOWN, show ⬇️ (below threshold).
+        """
         code = f" ({self.status_code})" if self.status_code else ""
         rt = f" {self.response_time_ms:.0f}ms" if self.response_time_ms else ""
         err = f" - {self.error}" if self.error else ""
         if self.status == "UP":
             icon = "✅"
         elif self.status == "DOWN":
-            icon = "🚨"
+            icon = "🚨" if alert_active else "⬇️"
         else:
             icon = "⚠️"
         return f"{icon} [{self.timestamp}] {self.url}: {self.status}{code}{rt}{err}"
@@ -104,12 +111,22 @@ class CheckResult:
 # ---------------------------------------------------------------------------
 def check_url(url: str, timeout: int = DEFAULT_TIMEOUT,
               max_retries: int = DEFAULT_MAX_RETRIES,
-              expected_status: int = 200) -> CheckResult:
-    """
-    Send an HTTP GET to *url* and return a CheckResult.
+              expected_statuses: Optional[list[int]] = None) -> CheckResult:
+    """Send an HTTP GET to *url* and return a CheckResult.
+
     Retries up to *max_retries* times before declaring DOWN to avoid
     false alarms from momentary blips.
+
+    Args:
+        url: Target URL.
+        timeout: HTTP request timeout in seconds.
+        max_retries: How many attempts before declaring DOWN.
+        expected_statuses: List of acceptable HTTP status codes.
+                           Defaults to [200] if not provided.
     """
+    if expected_statuses is None:
+        expected_statuses = [200]
+
     last_error = None
 
     for attempt in range(1, max_retries + 1):
@@ -118,12 +135,13 @@ def check_url(url: str, timeout: int = DEFAULT_TIMEOUT,
             resp = requests.get(url, timeout=timeout, allow_redirects=True)
             elapsed_ms = (time.monotonic() - start) * 1000
 
-            if resp.status_code == expected_status:
+            if resp.status_code in expected_statuses:
                 return CheckResult(url, "UP", resp.status_code, elapsed_ms)
             else:
+                expected_str = ", ".join(str(s) for s in expected_statuses)
                 return CheckResult(
                     url, "WARNING", resp.status_code, elapsed_ms,
-                    error=f"Expected {expected_status}, got {resp.status_code}",
+                    error=f"Expected {expected_str}, got {resp.status_code}",
                 )
 
         except requests.exceptions.Timeout:
@@ -196,7 +214,8 @@ def send_email_alert(result: CheckResult, recipient: str) -> None:
 def print_summary(results: list[CheckResult], urls: list[str]) -> None:
     """Print a summary report after monitoring completes.
 
-    Shows per-URL: total checks, uptime %, average response time, downtime periods.
+    Shows per-URL: total checks, UP/WARNING/DOWN counts, effective uptime
+    (UP + WARNING) / total, average/min/max response time, downtime periods.
     """
     if not results:
         return
@@ -214,7 +233,10 @@ def print_summary(results: list[CheckResult], urls: list[str]) -> None:
         up_count = sum(1 for r in url_results if r.status == "UP")
         warning_count = sum(1 for r in url_results if r.status == "WARNING")
         down_count = sum(1 for r in url_results if r.status == "DOWN")
-        uptime_pct = (up_count / total) * 100 if total else 0
+
+        # Effective uptime: sites that are reachable (UP or WARNING) count as up
+        reachable = up_count + warning_count
+        uptime_pct = (reachable / total) * 100 if total else 0
 
         # Response times (only for checks that got a response)
         response_times = [r.response_time_ms for r in url_results if r.response_time_ms is not None]
@@ -222,7 +244,7 @@ def print_summary(results: list[CheckResult], urls: list[str]) -> None:
         min_rt = min(response_times) if response_times else 0
         max_rt = max(response_times) if response_times else 0
 
-        # Downtime periods
+        # Downtime periods (only DOWN status)
         downtime_periods = []
         in_downtime = False
         downtime_start = None
@@ -240,7 +262,7 @@ def print_summary(results: list[CheckResult], urls: list[str]) -> None:
         print(f"  {'─' * 50}")
         print(f"  Total checks:     {total}")
         print(f"  UP: {up_count}  |  WARNING: {warning_count}  |  DOWN: {down_count}")
-        print(f"  Uptime:           {uptime_pct:.1f}%")
+        print(f"  Uptime (UP+WARN): {uptime_pct:.1f}%")
         if response_times:
             print(f"  Response time:    avg {avg_rt:.0f}ms  |  min {min_rt:.0f}ms  |  max {max_rt:.0f}ms")
         else:
@@ -269,6 +291,8 @@ Examples:
   python status_monitor.py --url https://example.com --interval 30 --checks 10
   python status_monitor.py --url https://example.com --url https://google.com
   python status_monitor.py --url https://example.com --email you@gmail.com
+  python status_monitor.py --url https://example.com --expected-status 200 --expected-status 201
+  python status_monitor.py --url https://example.com --alert-threshold 3
 
 Email setup (Gmail):
   export SMTP_USER="yourbot@gmail.com"
@@ -301,8 +325,17 @@ Email setup (Gmail):
         help="Email address to send DOWN alerts to (requires SMTP_USER/SMTP_PASS env vars)",
     )
     p.add_argument(
-        "--expected-status", type=int, default=200,
-        help="Expected HTTP status code (default: 200)",
+        "--expected-status", action="append", dest="expected_statuses",
+        type=int, default=None,
+        help="Expected HTTP status code(s) — use multiple times (default: 200)",
+    )
+    p.add_argument(
+        "--alert-threshold", type=int, default=DEFAULT_ALERT_THRESHOLD,
+        help=f"Consecutive DOWN checks before sending alert (default: {DEFAULT_ALERT_THRESHOLD})",
+    )
+    p.add_argument(
+        "--log-dir", type=str, default="./logs",
+        help="Directory for log files (default: ./logs)",
     )
     p.add_argument(
         "-v", "--verbose", action="store_true",
@@ -330,17 +363,23 @@ def main() -> None:
         print("❌ Interval must be at least 1 second.")
         sys.exit(1)
 
+    # Validate alert threshold
+    if args.alert_threshold < 1:
+        print("❌ Alert threshold must be at least 1.")
+        sys.exit(1)
+
     urls = args.urls
     interval = args.interval
     max_checks = args.checks if args.checks > 0 else None   # None = infinite
     timeout = args.timeout
     max_retries = args.retries
-    expected_status = args.expected_status
+    expected_statuses = args.expected_statuses if args.expected_statuses else [200]
+    alert_threshold = args.alert_threshold
     email_recipient = args.email
+    log_dir = os.path.abspath(args.log_dir)
     verbose = args.verbose
 
-    # Open log file once for the entire run (append mode, date-stamped)
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+    # Set up log directory and open log file once for the entire run
     os.makedirs(log_dir, exist_ok=True)
     log_filename = os.path.join(log_dir, f"status_log_{datetime.now().strftime('%Y-%m-%d')}.txt")
 
@@ -353,10 +392,16 @@ def main() -> None:
         f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"URLs: {', '.join(urls)}\n"
         f"Interval: {interval}s | Timeout: {timeout}s | Retries: {max_retries}\n"
+        f"Expected statuses: {', '.join(str(s) for s in expected_statuses)}\n"
+        f"Alert threshold: {alert_threshold} consecutive DOWN(s)\n"
         f"{'=' * 60}\n"
     )
     log_file.write(header)
     log_file.flush()
+
+    # Open JSONL history file once for the entire run (append mode)
+    history_path = os.path.join(log_dir, "history.jsonl")
+    history_file = open(history_path, "a", encoding="utf-8")
 
     print(f"\n🔍 Monitoring {len(urls)} URL(s) every {interval}s")
     if max_checks:
@@ -364,12 +409,16 @@ def main() -> None:
     else:
         print(f"   Running until Ctrl+C")
     if email_recipient:
-        print(f"   📧 Email alerts → {email_recipient}")
-    print(f"   📄 Log file: {log_filename}\n")
+        print(f"   📧 Email alerts → {email_recipient} (threshold: {alert_threshold})")
+    print(f"   📄 Log file: {log_filename}")
+    print(f"   📊 History: {history_path}\n")
 
     # Track results for summary
     results: list[CheckResult] = []
     check_count = 0
+
+    # Track consecutive failures per URL for alert threshold
+    consecutive_down: dict[str, int] = {url: 0 for url in urls}
 
     try:
         while True:
@@ -380,32 +429,32 @@ def main() -> None:
                     url,
                     timeout=timeout,
                     max_retries=max_retries,
-                    expected_status=expected_status,
+                    expected_statuses=expected_statuses,
                 )
                 results.append(result)
 
+                # Track consecutive failures
+                if result.status == "DOWN":
+                    consecutive_down[url] += 1
+                else:
+                    consecutive_down[url] = 0
+
+                # Determine if alert threshold is met
+                alert_active = consecutive_down[url] >= alert_threshold
+
                 # Console output
-                print(result.console_line())
+                print(result.console_line(alert_active=alert_active))
 
                 # Log file output
                 log_file.write(result.log_line() + "\n")
                 log_file.flush()
 
-                # Save to JSON history
-                history_path = os.path.join(log_dir, "history.json")
-                history = []
-                if os.path.exists(history_path):
-                    try:
-                        with open(history_path, "r") as hf:
-                            history = json.load(hf)
-                    except (json.JSONDecodeError, ValueError):
-                        history = []
-                history.append(result.to_dict())
-                with open(history_path, "w") as hf:
-                    json.dump(history, hf, indent=2)
+                # Append one line to JSONL history (no read-rewrite)
+                history_file.write(json.dumps(result.to_dict()) + "\n")
+                history_file.flush()
 
-                # Email alert on DOWN
-                if result.status == "DOWN" and email_recipient:
+                # Email alert only when threshold is met (on the exact check that crosses it)
+                if alert_active and consecutive_down[url] == alert_threshold and email_recipient:
                     send_email_alert(result, email_recipient)
 
             # Check if we've reached the requested number of checks
@@ -420,7 +469,7 @@ def main() -> None:
         print("\n\n⏹  Stopped by Ctrl+C")
 
     finally:
-        # Always print summary and close log cleanly
+        # Always print summary and close files cleanly
         print_summary(results, urls)
 
         # Write session footer to log
@@ -432,7 +481,9 @@ def main() -> None:
         )
         log_file.write(footer)
         log_file.close()
+        history_file.close()
         print(f"📄 Log saved to: {log_filename}")
+        print(f"📊 History saved to: {history_path}")
 
 
 if __name__ == "__main__":
