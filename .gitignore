@@ -1,0 +1,18 @@
+# Logs
+logs/
+*.log
+
+# History
+history.json
+
+# Config (contains secrets)
+config.yaml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.egg-info/
+.env
