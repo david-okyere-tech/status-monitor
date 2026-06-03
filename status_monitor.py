@@ -27,6 +27,7 @@ import os
 import smtplib
 import sys
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from email.message import EmailMessage
@@ -259,8 +260,6 @@ class AlertState:
         self.alert_fired: dict[str, bool] = {url: False for url in urls}
         self.outage_start: dict[str, Optional[str]] = {url: None for url in urls}
         self.cooldown_remaining: dict[str, int] = {url: 0 for url in urls}
-        # Track outage_start across cooldown so recovery emails work correctly
-        self._pending_outage_start: dict[str, Optional[str]] = {url: None for url in urls}
 
     def update(self, result: CheckResult) -> tuple[bool, bool]:
         """Process a check result and return (should_alert, is_recovery).
@@ -271,9 +270,13 @@ class AlertState:
         url = result.url
 
         if result.status == "DOWN":
-            # Decrement cooldown if active
+            # In cooldown from a recent recovery — suppress alerts entirely
             if self.cooldown_remaining[url] > 0:
                 self.cooldown_remaining[url] -= 1
+                self.consecutive_down[url] += 1
+                if self.outage_start[url] is None:
+                    self.outage_start[url] = result.timestamp
+                return False, False
 
             self.consecutive_down[url] += 1
 
@@ -297,7 +300,6 @@ class AlertState:
             self.consecutive_down[url] = 0
             self.alert_fired[url] = False
             self.outage_start[url] = None
-            self._pending_outage_start[url] = None
 
             if was_in_outage and outage_start is not None:
                 # Start cooldown to prevent flapping spam
@@ -456,7 +458,7 @@ def send_recovery_email(
 # Summary report
 # ---------------------------------------------------------------------------
 def print_summary(
-    results: list[CheckResult],
+    results: deque[CheckResult] | list[CheckResult],
     urls: list[str],
     count_warnings_as_up: bool = True,
 ) -> None:
@@ -708,7 +710,7 @@ def main() -> None:
     history_file = None
     log_filename = ""
     history_path = ""
-    results: list[CheckResult] = []
+    results: deque[CheckResult] = deque(maxlen=DEFAULT_MAX_RESULTS)
     check_count = 0
 
     try:
@@ -775,10 +777,8 @@ def main() -> None:
                 should_alert, is_recovery = alert_state.update(result)
                 alert_active = alert_state.alert_fired.get(result.url, False)
 
-                # Append to results (cap to prevent unbounded memory growth)
+                # Append to results (deque handles max size automatically)
                 results.append(result)
-                if len(results) > DEFAULT_MAX_RESULTS:
-                    results = results[-DEFAULT_MAX_RESULTS:]
 
                 # Console output
                 print(result.console_line(alert_active=alert_active))
