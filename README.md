@@ -114,10 +114,10 @@ The alert system handles the full outage lifecycle:
 ⬇️  Check 2: DOWN (below threshold, no alert)
 🚨  Check 3: DOWN (threshold reached, alert fires 📧)
 ⬇️  Check 4: DOWN (already alerted, no duplicate)
-⚠️  Check 5: WARNING 500 (site reachable but degraded — no recovery)
-⬇️  Check 6: DOWN (cooldown active from prior alert, suppressed)
+⚠️  Check 5: WARNING 500 (site reachable but degraded — no recovery, outage continues)
+⬇️  Check 6: DOWN (still in outage, counter continues)
 ✅  Check 7: UP (recovery email 📧, cooldown starts)
-⬇️  Check 8: DOWN (in cooldown, suppressed)
+⬇️  Check 8: DOWN (in cooldown — suppressed, no alert)
 ⬇️  Check 9: DOWN (cooldown expired, counter restarts)
 ```
 
