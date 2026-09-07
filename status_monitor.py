@@ -1,11 +1,13 @@
 """
-Status Monitor v4.0 (Production Refactor)
+Status Monitor v4.1 (Production Refactor + fixes)
 - Async IO (httpx) instead of Threads
 - Persistent Alert State (survives crashes)
-- O(1) Memory footprint (no more deque hoarding)
+- Bounded memory (downtime_periods capped; no more deque hoarding)
 - OS-level File Locking (fcntl) instead of PID files
 - Exponential Backoff with Jitter
 - Rotating File Handlers for logs
+- State/history writes batched once per cycle instead of once per URL
+- SSL verification set at the httpx.Client level (works with modern httpx)
 """
 from __future__ import annotations
 
@@ -38,6 +40,7 @@ DEFAULT_ALERT_THRESHOLD = 1
 DEFAULT_LOG_DIR = "./logs"
 LOCK_FILENAME = "status_monitor.lock"
 STATE_FILENAME = ".state.json"
+MAX_DOWNTIME_PERIODS = 100  # keep memory bounded on long-running processes
 
 @dataclass
 class TargetConfig:
@@ -68,7 +71,7 @@ class CheckResult:
 
 @dataclass
 class URLStats:
-    """O(1) Memory Statistics Tracker"""
+    """Bounded-memory statistics tracker"""
     total: int = 0
     up: int = 0
     down: int = 0
@@ -86,20 +89,22 @@ class URLStats:
         if result.status == "UP": self.up += 1
         elif result.status == "DOWN": self.down += 1
         else: self.warning += 1
-        
+
         if result.response_time_ms is not None:
             self.rt_sum += result.response_time_ms
             self.rt_count += 1
             if result.response_time_ms < self.rt_min: self.rt_min = result.response_time_ms
             if result.response_time_ms > self.rt_max: self.rt_max = result.response_time_ms
-            
+
         if result.status == "DOWN" and not self.in_downtime:
             self.in_downtime = True
             self.downtime_start = result.timestamp
         elif result.status != "DOWN" and self.in_downtime:
             self.in_downtime = False
             self.downtime_periods.append((self.downtime_start, result.timestamp))
-            
+            if len(self.downtime_periods) > MAX_DOWNTIME_PERIODS:
+                self.downtime_periods = self.downtime_periods[-MAX_DOWNTIME_PERIODS:]
+
     def finalize(self, last_timestamp: str):
         if self.in_downtime and self.downtime_start:
             self.downtime_periods.append((self.downtime_start, last_timestamp))
@@ -135,7 +140,12 @@ class AlertStateManager:
             }
         return self.states[url]
 
-    def update(self, result: CheckResult, threshold: int, cooldown_checks: int = 3) -> tuple[bool, bool]:
+    def update(self, result: CheckResult, threshold: int, cooldown_checks: int = 3, persist: bool = True) -> tuple[bool, bool]:
+        """
+        persist=False lets callers batch saves — e.g. call update() for every
+        URL in a check cycle, then call save() once at the end of the cycle,
+        instead of hitting disk once per URL per cycle.
+        """
         state = self.get(result.url)
         should_alert, is_recovery = False, False
 
@@ -164,22 +174,28 @@ class AlertStateManager:
         else:  # WARNING
             state["consecutive_down"] = 0
 
-        self.save()
+        if persist:
+            self.save()
         return should_alert, is_recovery
 
 # ---------------------------------------------------------------------------
 # Async Core Logic
 # ---------------------------------------------------------------------------
 async def check_url_async(client: httpx.AsyncClient, target: TargetConfig) -> CheckResult:
+    """
+    NOTE: `verify` is intentionally NOT passed here. SSL verification is set
+    at the httpx.AsyncClient construction level (see run_loop) because
+    per-request `verify=` was deprecated/removed in newer httpx releases.
+    """
     max_attempts = target.retries + 1
     last_error = None
-    
+
     for attempt in range(1, max_attempts + 1):
         try:
             start = time.monotonic()
-            resp = await client.get(target.url, timeout=target.timeout, follow_redirects=True, verify=target.verify_ssl)
+            resp = await client.get(target.url, timeout=target.timeout, follow_redirects=True)
             elapsed_ms = (time.monotonic() - start) * 1000
-            
+
             if resp.status_code in target.expected_statuses:
                 return CheckResult(target.url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "UP", resp.status_code, elapsed_ms, None, attempt)
             else:
@@ -189,16 +205,16 @@ async def check_url_async(client: httpx.AsyncClient, target: TargetConfig) -> Ch
                     await asyncio.sleep(backoff)
                     continue
                 return CheckResult(target.url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "WARNING", resp.status_code, elapsed_ms, last_error, attempt)
-                
+
         except httpx.ConnectError: last_error = "Connection failed"
         except httpx.TimeoutException: last_error = "Request timed out"
         except httpx.TooManyRedirects: last_error = "Too many redirects"
         except httpx.RequestError as exc: last_error = str(exc)
-            
+
         if attempt < max_attempts:
             backoff = min(30, (2 ** attempt) + random.uniform(0, 1))
             await asyncio.sleep(backoff)
-            
+
     return CheckResult(target.url, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "DOWN", None, None, last_error, max_attempts)
 
 async def send_email_async(result: CheckResult, recipient: str, outage_start: Optional[str] = None, is_recovery: bool = False):
@@ -213,7 +229,7 @@ async def send_email_async(result: CheckResult, recipient: str, outage_start: Op
     msg = EmailMessage()
     msg["From"] = user
     msg["To"] = recipient
-    
+
     if is_recovery:
         msg["Subject"] = f"✅ Status Monitor: {result.url} is back UP"
         msg.set_content(f"URL: {result.url}\nOutage started: {outage_start}\nRecovered at: {result.timestamp}\n")
@@ -234,10 +250,17 @@ async def send_email_async(result: CheckResult, recipient: str, outage_start: Op
 # Process Locking & Logging
 # ---------------------------------------------------------------------------
 def acquire_lock(log_dir: str):
+    """
+    Opens in append mode (not 'w') so we never truncate another running
+    instance's lock file content before we know whether we actually hold
+    the lock. Only truncate + write our own PID after flock succeeds.
+    """
     lock_path = os.path.join(log_dir, LOCK_FILENAME)
-    lock_file = open(lock_path, "w")
+    lock_file = open(lock_path, "a+")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_file.seek(0)
+        lock_file.truncate()
         lock_file.write(str(os.getpid()))
         lock_file.flush()
         return lock_file
@@ -249,7 +272,7 @@ def setup_logging(log_dir: str) -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
     logger = logging.getLogger("status_monitor")
     logger.setLevel(logging.INFO)
-    
+
     # Rotating file handler prevents disk exhaustion (5MB max, keep 3 backups)
     handler = RotatingFileHandler(
         os.path.join(log_dir, "monitor.log"), maxBytes=5*1024*1024, backupCount=3
@@ -259,12 +282,12 @@ def setup_logging(log_dir: str) -> logging.Logger:
     return logger
 
 # ---------------------------------------------------------------------------
-# Main Execution Loop
+# Config Loading
 # ---------------------------------------------------------------------------
 def load_config(config_path: str) -> tuple[dict, list[TargetConfig]]:
     with open(config_path, 'r') as f:
         data = json.load(f)
-    
+
     global_conf = data.get("global", {})
     targets = []
     for t in data.get("targets", []):
@@ -278,6 +301,9 @@ def load_config(config_path: str) -> tuple[dict, list[TargetConfig]]:
         ))
     return global_conf, targets
 
+# ---------------------------------------------------------------------------
+# Main Execution Loop
+# ---------------------------------------------------------------------------
 async def run_loop(targets: list[TargetConfig], interval: int, email: Optional[str], log_dir: str):
     lock_file = acquire_lock(log_dir)
     if not lock_file:
@@ -287,41 +313,57 @@ async def run_loop(targets: list[TargetConfig], interval: int, email: Optional[s
     logger = setup_logging(log_dir)
     state_mgr = AlertStateManager(os.path.join(log_dir, STATE_FILENAME))
     stats: dict[str, URLStats] = {t.url: URLStats() for t in targets}
-    
+
     history_path = os.path.join(log_dir, "history.jsonl")
     history_file = open(history_path, "a", encoding="utf-8")
+    history_buffer: list[str] = []
 
     print(f"🔍 Monitoring {len(targets)} URL(s) every {interval}s (Async)")
     if email: print(f"   📧 Alerts → {email}")
     print(f"   🔒 Lock: Active | 📊 History: {history_path}\n")
 
     try:
-        async with httpx.AsyncClient() as client:
+        # Two clients so per-target verify_ssl still works, without passing
+        # a deprecated `verify=` kwarg on every request.
+        async with httpx.AsyncClient(verify=True) as client_verified, \
+                   httpx.AsyncClient(verify=False) as client_unverified:
+
+            def client_for(target: TargetConfig) -> httpx.AsyncClient:
+                return client_verified if target.verify_ssl else client_unverified
+
             while True:
                 check_start = time.monotonic()
-                tasks = [check_url_async(client, t) for t in targets]
+                tasks = [check_url_async(client_for(t), t) for t in targets]
                 results = await asyncio.gather(*tasks)
-                
+
                 for result, target in zip(results, targets):
                     stats[result.url].update(result)
-                    should_alert, is_recovery = state_mgr.update(result, target.alert_threshold)
-                    
+                    should_alert, is_recovery = state_mgr.update(
+                        result, target.alert_threshold, persist=False
+                    )
+
                     # Console & Log
                     icon = "✅" if result.status == "UP" else ("🚨" if result.status == "DOWN" else "⚠️")
                     line = f"{icon} [{result.timestamp}] {result.url}: {result.status} ({result.status_code}) {result.error or ''}"
                     print(line)
                     logger.info(line)
-                    
-                    # JSONL
-                    history_file.write(json.dumps(result.to_dict()) + "\n")
-                    history_file.flush()
-                    
+
+                    # Buffer JSONL — one write per cycle, not one per URL
+                    history_buffer.append(json.dumps(result.to_dict()))
+
                     # Alerts
                     if email:
                         if should_alert:
                             await send_email_async(result, email)
                         elif is_recovery:
                             await send_email_async(result, email, outage_start=state_mgr.get(result.url).get("outage_start"), is_recovery=True)
+
+                # Batched disk writes — once per cycle, not once per URL
+                state_mgr.save()
+                if history_buffer:
+                    history_file.write("\n".join(history_buffer) + "\n")
+                    history_file.flush()
+                    history_buffer.clear()
 
                 elapsed = time.monotonic() - check_start
                 await asyncio.sleep(max(0, interval - elapsed))
@@ -332,7 +374,7 @@ async def run_loop(targets: list[TargetConfig], interval: int, email: Optional[s
         history_file.close()
         fcntl.flock(lock_file, fcntl.LOCK_UN)
         lock_file.close()
-        
+
         # Print Summary
         print("\n" + "=" * 60 + "\n  MONITORING SUMMARY\n" + "=" * 60)
         for url, s in stats.items():
@@ -342,7 +384,65 @@ async def run_loop(targets: list[TargetConfig], interval: int, email: Optional[s
             print(f"\n  📍 {url}\n  Total: {s.total} | UP: {s.up} | WARN: {s.warning} | DOWN: {s.down} | Uptime: {uptime:.1f}%")
             if s.rt_count: print(f"  Response: avg {avg_rt:.0f}ms | min {s.rt_min:.0f}ms | max {s.rt_max:.0f}ms")
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def _targets_from_cli_args(args: argparse.Namespace) -> list[TargetConfig]:
+    targets = []
+    for url in (args.urls or []):
+        targets.append(TargetConfig(
+            url=url,
+            expected_statuses=args.expected_status or [200],
+            timeout=args.timeout,
+            retries=args.retries,
+            verify_ssl=not args.no_verify_ssl,
+            alert_threshold=args.alert_threshold,
+        ))
+    return targets
+
 def main():
+    # --- RECONSTRUCTED: your pasted file cuts off mid-argparse both times
+    # (`dest="urls", help` with nothing after it). Everything below this
+    # point is my best-effort reconstruction based on the constants,
+    # TargetConfig fields, README, and status-monitor.service in your repo.
+    # Diff this against your actual main() before trusting it.
     parser = argparse.ArgumentParser(description="Async Status Monitor v4.0")
-    parser.add_argument("--config", type=str, help="Path to JSON config file")
-    parser.add_argument("--url", action="append", dest="urls", help
+    parser.add_argument("--config", type=str, help="Path to a JSON config file (see README)")
+    parser.add_argument("--url", action="append", dest="urls",
+                         help="URL to monitor (repeatable; combines with --config if both given)")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL,
+                         help=f"Seconds between check cycles (default: {DEFAULT_INTERVAL})")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                         help=f"HTTP request timeout in seconds (default: {DEFAULT_TIMEOUT})")
+    parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
+                         help=f"Retries after the first attempt (default: {DEFAULT_RETRIES})")
+    parser.add_argument("--expected-status", action="append", dest="expected_status", type=int,
+                         help="Expected HTTP status code (repeatable, default: 200)")
+    parser.add_argument("--alert-threshold", type=int, default=DEFAULT_ALERT_THRESHOLD,
+                         help=f"Consecutive DOWN checks before alerting (default: {DEFAULT_ALERT_THRESHOLD})")
+    parser.add_argument("--email", type=str, default=None,
+                         help="Email address for DOWN/recovery alerts")
+    parser.add_argument("--log-dir", type=str, default=DEFAULT_LOG_DIR,
+                         help=f"Directory for lock/state/log/history files (default: {DEFAULT_LOG_DIR})")
+    parser.add_argument("--no-verify-ssl", action="store_true",
+                         help="Disable SSL certificate verification")
+    args = parser.parse_args()
+
+    targets: list[TargetConfig] = []
+    if args.config:
+        _, config_targets = load_config(args.config)
+        targets.extend(config_targets)
+    targets.extend(_targets_from_cli_args(args))
+
+    if not targets:
+        parser.error("No targets specified — use --url (repeatable) and/or --config")
+
+    os.makedirs(args.log_dir, exist_ok=True)
+
+    try:
+        asyncio.run(run_loop(targets, args.interval, args.email, args.log_dir))
+    except KeyboardInterrupt:
+        print("\n👋 Stopped.")
+
+if __name__ == "__main__":
+    main()
