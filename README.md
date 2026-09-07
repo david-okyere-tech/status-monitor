@@ -49,8 +49,8 @@ python status_monitor.py --config config.json
 
 ## Config File
 
-`--config` loads targets and global defaults from a JSON file instead of (or alongside — TODO: confirm which)
-repeated `--url` flags:
+`--config` loads targets and global defaults from a JSON file. It combines with `--url`, not
+replaces it — targets from `--config` and any repeated `--url` flags are both monitored together:
 
 ```json
 {
@@ -72,17 +72,18 @@ Any field set at the target level overrides the `global` default for that target
 
 ## CLI Options
 
-> ⚠️ **TODO**: this table needs to be checked against the actual `argparse` block in `main()` —
-> confirm exact flag names, defaults, and whether `--checks` / `--strict-uptime` / `-v` are still
-> implemented in v4 or were left over from the v3 rewrite.
+Verified directly against the `argparse` block in `main()` — there is no `--checks`,
+`--strict-uptime`, or `-v`; those were never implemented in v4.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config` | *(none)* | Path to a JSON config file (see above) |
-| `--url` | *(required if no `--config`)* | URL to monitor (repeatable) |
+| `--url` | *(required if no `--config`)* | URL to monitor (repeatable; combines with `--config`) |
 | `--interval` | 60 | Seconds between check cycles |
 | `--timeout` | 10 | HTTP request timeout in seconds |
 | `--retries` | 2 | Retries after the first attempt |
+| `--expected-status` | 200 | Expected HTTP status code (repeatable) — applies to all `--url` targets |
+| `--alert-threshold` | 1 | Consecutive DOWN checks before an alert fires |
 | `--email` | *(none)* | Email address for DOWN/recovery alerts |
 | `--log-dir` | ./logs | Directory for lock file, state file, logs, and history |
 | `--no-verify-ssl` | off | Disable SSL certificate verification |
@@ -119,9 +120,13 @@ You **must** use an App Password, not your regular Gmail password:
 1. **DOWN detected** — per-URL counter increments
 2. **Threshold crossed** — alert fires once, not on every check
 3. **Site recovers (UP)** — recovery email sent with outage start time; cooldown begins
-4. **Cooldown** — DOWN checks during the cooldown window don't fire alerts (prevents flap spam)
+4. **Cooldown** — DOWN checks during the cooldown window don't fire alerts (prevents flap spam). The
+   cooldown counter keeps counting down through those suppressed DOWN checks — it does not reset — so
+   once it hits 0 the very next DOWN check can alert immediately. If the site stays up instead, the
+   cooldown is cleared, so a later, unrelated outage isn't wrongly suppressed by a stale leftover
+   cooldown from an old flap.
 5. **WARNING ≠ recovery** — a WARNING does not end an outage; only UP does
-6. **Crash-safe** — alert state is persisted to `.state.json`, so a restart mid-outage won't re-fire or lose track of an already-alerted outage
+6. **Crash-safe** — alert state is persisted to `.state.json`, so a restart mid-outage won't re-fire or lose track of an already-alerted outage. If `.state.json` is ever corrupted, it's quarantined to `.state.json.corrupt`, a warning is logged, and monitoring starts with fresh alert state rather than failing silently.
 
 ```
 ⬇️  Check 1: DOWN (below threshold, no alert)
