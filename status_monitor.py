@@ -41,6 +41,7 @@ DEFAULT_LOG_DIR = "./logs"
 LOCK_FILENAME = "status_monitor.lock"
 STATE_FILENAME = ".state.json"
 MAX_DOWNTIME_PERIODS = 100  # keep memory bounded on long-running processes
+EMAIL_SEND_TIMEOUT = 15  # seconds — bounds SMTP send so a hung server can't stall the check loop
 
 @dataclass
 class TargetConfig:
@@ -123,8 +124,25 @@ class AlertStateManager:
             try:
                 with open(self.state_file, 'r') as f:
                     self.states = json.load(f)
-            except Exception:
-                self.states = {}  # Corrupt state, start fresh
+            except Exception as exc:
+                # Corrupt state file: this silently discarding was the old
+                # behavior, which quietly defeats the "crash-safe" guarantee
+                # (you'd lose in-progress outage tracking with no signal).
+                # Log loudly, preserve the bad file for inspection, and
+                # start fresh rather than overwrite the evidence.
+                quarantine_path = self.state_file + ".corrupt"
+                try:
+                    os.replace(self.state_file, quarantine_path)
+                except OSError:
+                    quarantine_path = None
+                msg = (
+                    f"⚠️  State file {self.state_file} is corrupt ({exc}) — "
+                    f"starting with fresh alert state."
+                    + (f" Bad file saved to {quarantine_path}." if quarantine_path else "")
+                )
+                print(msg)
+                logging.getLogger("status_monitor").warning(msg)
+                self.states = {}
 
     def save(self):
         temp_file = self.state_file + '.tmp'
@@ -164,12 +182,19 @@ class AlertStateManager:
         elif result.status == "UP":
             was_in_outage = state["alert_fired"]
             if was_in_outage and state["outage_start"]:
-                state["cooldown_remaining"] = cooldown_checks
+                # This UP is the recovery itself: start the cooldown window.
                 is_recovery = True
+                state["cooldown_remaining"] = cooldown_checks
+            else:
+                # A plain UP (no outage just ended). Clear any leftover
+                # cooldown so it can't silently suppress a *future*,
+                # unrelated outage — without this, a cooldown left over
+                # from an old flap would still be >0 when a genuinely new
+                # DOWN streak starts, and would wrongly delay that alert.
+                state["cooldown_remaining"] = 0
             state["consecutive_down"] = 0
             state["alert_fired"] = False
             state["outage_start"] = None
-            state["cooldown_remaining"] = 0 if not is_recovery else state["cooldown_remaining"]
 
         else:  # WARNING
             state["consecutive_down"] = 0
@@ -238,11 +263,16 @@ async def send_email_async(result: CheckResult, recipient: str, outage_start: Op
         msg.set_content(f"URL: {result.url}\nTime: {result.timestamp}\nError: {result.error}\n")
 
     try:
-        await aiosmtplib.send(
-            msg, hostname=host, port=port, username=user, password=passwd,
-            start_tls=use_tls, validate_certs=True
+        await asyncio.wait_for(
+            aiosmtplib.send(
+                msg, hostname=host, port=port, username=user, password=passwd,
+                start_tls=use_tls, validate_certs=True
+            ),
+            timeout=EMAIL_SEND_TIMEOUT,
         )
         print(f"  📧 {'Recovery' if is_recovery else 'Alert'} email sent to {recipient}")
+    except asyncio.TimeoutError:
+        print(f"  ⚠️  Email failed: SMTP send timed out after {EMAIL_SEND_TIMEOUT}s")
     except Exception as exc:
         print(f"  ⚠️  Email failed: {exc}")
 
@@ -358,12 +388,20 @@ async def run_loop(targets: list[TargetConfig], interval: int, email: Optional[s
                         elif is_recovery:
                             await send_email_async(result, email, outage_start=state_mgr.get(result.url).get("outage_start"), is_recovery=True)
 
-                # Batched disk writes — once per cycle, not once per URL
-                state_mgr.save()
+                # Batched disk writes — once per cycle, not once per URL.
+                # Both are blocking file I/O; run them in a thread so they
+                # can't stall the event loop (and therefore the next
+                # cycle's URL checks) while writing to a slow disk.
+                await asyncio.to_thread(state_mgr.save)
                 if history_buffer:
-                    history_file.write("\n".join(history_buffer) + "\n")
-                    history_file.flush()
+                    lines = "\n".join(history_buffer) + "\n"
                     history_buffer.clear()
+
+                    def _write_history(data: str = lines):
+                        history_file.write(data)
+                        history_file.flush()
+
+                    await asyncio.to_thread(_write_history)
 
                 elapsed = time.monotonic() - check_start
                 await asyncio.sleep(max(0, interval - elapsed))
@@ -401,12 +439,7 @@ def _targets_from_cli_args(args: argparse.Namespace) -> list[TargetConfig]:
     return targets
 
 def main():
-    # --- RECONSTRUCTED: your pasted file cuts off mid-argparse both times
-    # (`dest="urls", help` with nothing after it). Everything below this
-    # point is my best-effort reconstruction based on the constants,
-    # TargetConfig fields, README, and status-monitor.service in your repo.
-    # Diff this against your actual main() before trusting it.
-    parser = argparse.ArgumentParser(description="Async Status Monitor v4.0")
+    parser = argparse.ArgumentParser(description="Async Status Monitor v4.1")
     parser.add_argument("--config", type=str, help="Path to a JSON config file (see README)")
     parser.add_argument("--url", action="append", dest="urls",
                          help="URL to monitor (repeatable; combines with --config if both given)")
@@ -427,6 +460,18 @@ def main():
     parser.add_argument("--no-verify-ssl", action="store_true",
                          help="Disable SSL certificate verification")
     args = parser.parse_args()
+
+    # Basic input validation — previously a negative --retries silently
+    # produced max_attempts=0, so check_url_async's retry loop never ran
+    # and every check returned DOWN/error=None without actually trying.
+    if args.retries < 0:
+        parser.error("--retries must be >= 0")
+    if args.timeout <= 0:
+        parser.error("--timeout must be > 0")
+    if args.interval <= 0:
+        parser.error("--interval must be > 0")
+    if args.alert_threshold < 1:
+        parser.error("--alert-threshold must be >= 1")
 
     targets: list[TargetConfig] = []
     if args.config:
