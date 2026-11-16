@@ -1,0 +1,12 @@
+services:
+  monitor:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.example.yaml:/config/config.yaml:ro
+      - status-data:/data
+    restart: unless-stopped
+
+volumes:
+  status-data:

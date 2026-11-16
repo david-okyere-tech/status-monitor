@@ -1,9 +1,11 @@
-# Logs
+# Logs and runtime state
 logs/
 *.log
-
-# History
 history.jsonl
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
 
 # Python
 __pycache__/
@@ -12,4 +14,11 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+.venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local config and secrets
 .env
+config.local.yaml

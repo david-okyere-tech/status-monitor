@@ -9,11 +9,13 @@ User=statusmonitor
 Group=statusmonitor
 WorkingDirectory=/opt/status-monitor
 
-# EDIT THIS: Change the URL and options to match your setup
-ExecStart=/opt/status-monitor/venv/bin/python status_monitor.py \
+# Install the package into the venv first: pip install .
+# EDIT THIS: change the URL, or switch to --config /opt/status-monitor/config.yaml
+ExecStart=/opt/status-monitor/venv/bin/status-monitor \
     --url https://example.com \
     --interval 60 \
     --email alerts@example.com
+# Status page (optional): add --web --web-host 127.0.0.1 --web-port 8080
 
 Restart=on-failure
 RestartSec=10

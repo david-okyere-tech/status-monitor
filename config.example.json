@@ -1,0 +1,13 @@
+{
+  "global": {
+    "expected_statuses": [200],
+    "timeout": 10,
+    "retries": 2,
+    "verify_ssl": true,
+    "alert_threshold": 1
+  },
+  "targets": [
+    { "url": "https://example.com" },
+    { "url": "https://www.cloudflare.com", "name": "Cloudflare" }
+  ]
+}
