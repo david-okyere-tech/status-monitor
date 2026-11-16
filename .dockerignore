@@ -1,0 +1,10 @@
+.git
+.venv
+logs
+**/__pycache__
+.pytest_cache
+tests
+.github
+*.sqlite
+*.sqlite-*
+.env

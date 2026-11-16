@@ -1,0 +1,49 @@
+# Copy to config.yaml and edit.
+#   status-monitor validate --config config.example.yaml
+#   status-monitor run --config config.example.yaml --web
+
+global:
+  interval: 60
+  timeout: 10
+  retries: 2
+  expected_statuses: [200]
+  verify_ssl: true
+  alert_threshold: 1
+  ssl_warn_days: 14
+  history_retention_days: 30
+  concurrency: 20
+
+alerts:
+  # email: you@example.com
+  cooldown_checks: 3
+  # webhooks:
+  #   - url: https://hooks.slack.com/services/XXX/YYY/ZZZ
+  #     type: slack
+  #   - url: https://discord.com/api/webhooks/XXX/YYY
+  #     type: discord
+
+targets:
+  - name: Example
+    group: Public
+    url: https://example.com
+    contains: "Example Domain"
+
+  - name: Cloudflare
+    group: Public
+    url: https://www.cloudflare.com
+    max_latency_ms: 2000
+
+  - name: GitHub
+    group: Public
+    url: https://github.com
+
+  - name: Cloudflare DNS
+    group: Network
+    type: tcp
+    host: 1.1.1.1
+    port: 443
+
+  - name: Quad9
+    group: Network
+    type: ping
+    host: 9.9.9.9
